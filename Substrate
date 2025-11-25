@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+"""
+BACKLIT CANOPY v53-REALITY — Fully Interactive Emergent Physics + Chemistry
+Features:
+- Bidirectional matter-energy loop
+- Pointer birth/death
+- Cloud-density inertia (mass)
+- Real-time 3D visualization
+- Mouse interaction (spawn + drag)
+"""
+from __future__ import annotations
+from fractions import Fraction
+import math
+import numpy as np
+import argparse
+import signal
+import sys
+from typing import Optional
+
+# ========================= CONSTANTS ==========================
+TRITS = 9; BOXES = 3; PLANES = 3; CUBES = 8; TOPO = 360
+
+# ========================= PF-LIFT ==========================
+class PFLift:
+    def __init__(self, factor=12, denom_limit=1_000_000):
+        self.factor = int(factor); self.denom_limit = int(denom_limit)
+    @staticmethod
+    def _lcm(a,b): return abs(a//math.gcd(a,b)*b)
+    def ensure_subunit_fraction(self, frac: Fraction):
+        d = frac.denominator
+        if d <= 1: return
+        if d > self.denom_limit: d = self.denom_limit
+        self.factor = self._lcm(self.factor, d)
+    def to_subunit(self, rate):
+        if isinstance(rate, Fraction): frac = rate
+        else: frac = Fraction(rate).limit_denominator(self.denom_limit)
+        self.ensure_subunit_fraction(frac)
+        return int(frac.numerator * (self.factor // frac.denominator))
+    def angle_to_subunit(self, angle): return int(angle) % 360 * self.factor
+    def wrap(self): return 360 * self.factor
+
+# ========================= ROM ==========================
+class ROM:
+    def __init__(self, topo=360, boxes=3):
+        self.T = topo; self.boxes = boxes
+        self.box = np.zeros(topo, dtype=np.int32)
+        self.sub = np.zeros(topo, dtype=np.int32)
+        for d in range(topo):
+            q = d % 90
+            self.box[d] = q // 10
+            self.sub[d] = q % 10
+    def address_batch(self, deg):
+        deg = deg % self.T
+        bx = self.box[deg]
+        sx = self.sub[deg]
+        br = bx // self.boxes; bc = bx % self.boxes
+        tri = np.where(sx > 0, sx - 1, -1)
+        gap = sx == 0
+        return br, bc, tri, gap
+
+# ========================= POINTERBATCH ==========================
+class PointerBatch:
+    def __init__(self):
+        self.angles = np.zeros((0,3), dtype=np.int64)
+        self.deltas = np.zeros((0,3), dtype=np.int64)
+        self.planes = np.zeros((0,), dtype=np.int32)
+        self.amps = np.zeros((0,), dtype=np.int32)
+        self.ids = np.zeros((0,), dtype=np.int32)
+        self.next_id = 0
+        self.alive = np.ones(0, dtype=bool)
+
+    def add(self, angle_deg, delta, plane, amp, pf: PFLift):
+        ang_su = np.array([pf.angle_to_subunit(a) for a in angle_deg], dtype=np.int64)
+        delta_su = np.array([pf.to_subunit(delta)]*3 if np.isscalar(delta) else [pf.to_subunit(d) for d in delta], dtype=np.int64)
+        self.angles = np.vstack([self.angles, ang_su]) if self.angles.size else np.array([ang_su])
+        self.deltas = np.vstack([self.deltas, delta_su]) if self.deltas.size else np.array([delta_su])
+        self.planes = np.hstack([self.planes, plane])
+        self.amps = np.hstack([self.amps, amp])
+        self.ids = np.hstack([self.ids, self.next_id])
+        self.alive = np.hstack([self.alive, True])
+        self.next_id += 1
+        return self.next_id - 1
+
+    def kill(self, idx):
+        self.alive[idx] = False
+
+    def cleanup(self):
+        alive = self.alive
+        if alive.all(): return
+        self.angles = self.angles[alive]
+        self.deltas = self.deltas[alive]
+        self.planes = self.planes[alive]
+        self.amps = self.amps[alive]
+        self.ids = self.ids[alive]
+        self.alive = self.alive[alive]
+
+    def step(self, pf: PFLift, rom: ROM, cubes):
+        if not self.alive.any(): return {}
+        wrap_val = pf.wrap()
+        self.angles[self.alive] = (self.angles[self.alive] + self.deltas[self.alive]) % wrap_val
+        deg = (self.angles[self.alive] // pf.factor).astype(np.int32)
+        px,py,pz = deg[:,0], deg[:,1], deg[:,2]
+        hx = (px // 180) & 1; hy = (py // 180) & 1; hz = (pz // 180) & 1
+        cube_idx = (hx + 2*hy + 4*hz) % cubes
+        br, bc, tri, gap = rom.address_batch(px)
+        mask_gap = gap; mask_data = ~gap
+        return {
+            'gap_idx': np.where(mask_gap)[0],
+            'gap_cube': cube_idx[mask_gap],
+            'gap_plane': self.planes[self.alive][mask_gap],
+            'gap_br': br[mask_gap],
+            'gap_bc': bc[mask_gap],
+            'gap_amp': self.amps[self.alive][mask_gap],
+            'data_idx': np.where(mask_data)[0],
+            'data_cube': cube_idx[mask_data],
+            'data_plane': self.planes[self.alive][mask_data],
+            'data_br': br[mask_data],
+            'data_bc': bc[mask_data],
+            'data_trit': tri[mask_data],
+            'data_amp': self.amps[self.alive][mask_data],
+        }
+
+# ========================= SUBSTRATE ==========================
+class Substrate:
+    def __init__(self, cubes):
+        self.cubes = cubes
+        self.trits = np.zeros((cubes,PLANES,BOXES,BOXES,TRITS), dtype=np.int8)
+        self.logical = np.zeros((cubes,PLANES,BOXES,BOXES), dtype=np.int32)
+        self.carry = np.zeros_like(self.logical)
+        self.routing = np.zeros((cubes,PLANES,BOXES,BOXES,3), dtype=np.int32)
+        self.spin = np.zeros_like(self.trits)
+        self.coherence = np.zeros_like(self.logical)
+        self.clouds = np.zeros((cubes,PLANES,BOXES,BOXES), dtype=np.int32)
+        self.snapshot()
+    def snapshot(self):
+        self.prev_trits = self.trits.copy()
+        self.prev_logical = self.logical.copy()
+        self.prev_carry = self.carry.copy()
+        self.prev_routing = self.routing.copy()
+        self.prev_spin = self.spin.copy()
+        self.prev_coherence = self.coherence.copy()
+        self.prev_clouds = self.clouds.copy()
+    def expand(self):
+        newtr = np.zeros_like(self.trits)
+        for d in range(1,10):
+            mask = (self.logical == d)
+            if mask.any():
+                r,p,br,bc = np.where(mask)
+                newtr[r,p,br,bc,d-1] = 1
+        self.spin = np.where(newtr==1, np.maximum(self.spin, self.prev_spin), self.spin)
+        self.trits = newtr
+    def commit(self):
+        self.prev_spin = self.spin.copy()
+        self.expand()
+        self.logical.fill(0)
+
+# ========================= PLUGINS ==========================
+class CarryRouting:
+    def __init__(self, sub): self.sub = sub
+    def compute(self):
+        sub = self.sub; pc = sub.prev_carry; active = pc > 0
+        if not active.any(): return
+        r,p,br,bc = np.where(active)
+        val = pc[r,p,br,bc]
+        dr = sub.prev_routing[r,p,br,bc,0]
+        dc = sub.prev_routing[r,p,br,bc,1]
+        tr_br = (br + dr) % BOXES
+        tr_bc = (bc + dc) % BOXES
+        tmp = np.zeros_like(sub.logical)
+        np.add.at(tmp, (r,p,tr_br,tr_bc), val)
+        sub.logical = (sub.logical + tmp) % 10
+        sub.carry[r,p,br,bc] -= val
+        sub.carry = np.maximum(sub.carry, 0)
+
+class Hebbian3D:
+    def __init__(self, sub, strength=1): self.sub = sub; self.strength = strength
+    def compute(self):
+        sub = self.sub; prev = (sub.prev_trits.sum(axis=-1) > 0)
+        if not prev.any(): return
+        add_dr = np.zeros_like(sub.routing[...,0])
+        add_dc = np.zeros_like(sub.routing[...,1])
+        add_rot = np.zeros_like(sub.routing[...,2])
+        for dp in (-1,0,1):
+            for dr in (-1,0,1):
+                for dc in (-1,0,1):
+                    if dp==dr==dc==0: continue
+                    rolled = np.roll(np.roll(np.roll(prev, dp, axis=1), dr, axis=2), dc, axis=3)
+                    co = prev & rolled
+                    if not co.any(): continue
+                    rr,pp,br,bc = np.where(co)
+                    np.add.at(add_dr, (rr,pp,br,bc), dr * self.strength)
+                    np.add.at(add_dc, (rr,pp,br,bc), dc * self.strength)
+                    np.add.at(add_rot, (rr,pp,br,bc), dp * (abs(dr)+abs(dc)+1) * self.strength)
+        sub.routing[...,0] += add_dr
+        sub.routing[...,1] += add_dc
+        sub.routing[...,2] += add_rot
+
+class CoherenceDynamics:
+    def __init__(self, sub, gamma=1): self.sub = sub; self.gamma = gamma
+    def divergence(self, f):
+        return (np.roll(f,-1,axis=2)-np.roll(f,1,axis=2) +
+                np.roll(f,-1,axis=3)-np.roll(f,1,axis=3) +
+                np.roll(f,-1,axis=1)-np.roll(f,1,axis=1))
+    def compute(self):
+        sub = self.sub
+        bias = np.abs(sub.routing[...,0]) + np.abs(sub.routing[...,1])
+        flow = self.divergence(bias)
+        sub.coherence = sub.coherence - self.gamma * sub.coherence + flow + sub.carry
+
+class Condensation:
+    def __init__(self, sub, threshold=72): self.sub = sub; self.threshold = threshold
+    def compute(self):
+        sub = self.sub
+        f = sub.coherence
+        lap = (np.roll(f,1,axis=2)+np.roll(f,-1,axis=2)+
+               np.roll(f,1,axis=3)+np.roll(f,-1,axis-3)+
+               np.roll(f,1,axis=1)+np.roll(f,-1,axis=1)-6*f)
+        mask = np.abs(lap) >= self.threshold
+        if not mask.any(): return
+        r,p,br,bc = np.where(mask)
+        for i in range(len(r)):
+            d = sub.logical[r[i],p[i],br[i],bc[i]]
+            if d > 0:
+                sub.spin[r[i],p[i],br[i],bc[i],d-1] = 1
+            sub.carry[r[i],p[i],br[i],bc[i]] += 3  # energy release
+
+# ========================= POINTER PHYSICS + INTERACTION ==========================
+class PointerPhysicsPlugin:
+    def __init__(self, sub: Substrate, ptr: PointerBatch, rigid, pf: PFLift):
+        self.sub = sub; self.ptr = ptr; self.rigid = rigid; self.pf = pf
+
+    def compute(self):
+        sub, ptr, pf = self.sub, self.ptr, self.pf
+        alive = ptr.alive
+        if not alive.any(): return
+
+        # 1. Inertia: delta slowed by local cloud density
+        deg = (ptr.angles[alive] // pf.factor).astype(np.int32)[:,0]
+        hx = (deg // 180) & 1
+        cloud_local = sub.clouds[hx, 1, 0, 0].sum()  # proxy
+        inertia = 1 + cloud_local // 50
+        ptr.deltas[alive] = ptr.deltas[alive] // np.maximum(1, inertia)
+
+        # 2. Carry → acceleration
+        carry_sum = sub.carry.sum()
+        if carry_sum > 20:
+            ptr.deltas[alive] += np.random.randint(-1, 2, size=ptr.deltas[alive].shape)
+
+        # 3. Pointer–pointer phase locking
+        if len(ptr.angles) > 1:
+            dist = np.abs(ptr.angles[alive,None,:] - ptr.angles[None,alive,:])
+            close = (dist < pf.factor * 8).all(axis=-1)
+            i,j = np.where(np.triu(close, 1))
+            for a,b in zip(i,j):
+                avg = (ptr.deltas[alive][a] + ptr.deltas[alive][b]) // 2
+                ptr.deltas[alive][[a,b]] = avg
+                ptr.amps[alive][a] += ptr.amps[alive][b] // 3
+                if np.all(ptr.deltas[alive][a] == -ptr.deltas[alive][b]):
+                    ptr.amps[alive][[a,b]] //= 2
+
+        # 4. Death on low amplitude
+        ptr.amps[alive] -= 1
+        ptr.kill(np.where(alive)[0][ptr.amps[alive] <= 0])
+
+        # 5. Birth on high condensation
+        if sub.carry.max() > 100:
+            hot = np.where(sub.carry > 100)
+            for i in range(min(3, len(hot[0]))):
+                c, p, br, bc = [x[i] for x in hot]
+                angle = (np.random.rand(3) * 360).astype(int)
+                ptr.add(angle, delta=2, plane=p, amp=20, pf=pf)
+
+        # 6. Cloud diffusion
+        cloud = sub.prev_clouds.copy()
+        for axis in (1,2,3):
+            cloud += np.roll(cloud, 1, axis=axis) + np.roll(cloud, -1, axis=axis)
+        cloud //= 6
+        cloud += (sub.carry > 0).astype(np.int32) * 10
+        sub.clouds = cloud
+
+# ========================= RIGID MANAGER ==========================
+class RigidManager:
+    def __init__(self): self.groups = {}
+    def new_group(self, gid): self.groups[gid] = []
+    def add_pointer(self, gid, pid): self.groups.setdefault(gid, []).append(pid)
+    def step_group(self, gid, ptr: PointerBatch):
+        if gid not in self.groups or not self.groups[gid]: return
+        ids = [i for i in self.groups[gid] if i < len(ptr.alive) and ptr.alive[i]]
+        if len(ids) < 2: return
+        base = ptr.angles[ids[0]]
+        for pid in ids[1:]:
+            rel = ptr.angles[pid] - base
+            ptr.angles[pid] = base + rel
+
+# ========================= 3D VISUALIZATION ==========================
+try:
+    from pythreejs import *
+    import ipywidgets as widgets
+    from IPython.display import display
+    THREEJS = True
+except:
+    THREEJS = False
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+
+class Visualizer:
+    def __init__(self, bc):
+        self.bc = bc
+        if THREEJS:
+            self.setup_threejs()
+        else:
+            plt.ion()
+            self.fig = plt.figure(figsize=(10,8))
+            self.ax = self.fig.add_subplot(111, projection='3d')
+            self.ax.set_xlim(-2,2); self.ax.set_ylim(-2,2); self.ax.set_zlim(-2,2)
+
+        self.dragging = None
+        signal.signal(signal.SIGINT, self.cleanup)
+
+    def setup_threejs(self):
+        self.scene = Scene()
+        self.camera = PerspectiveCamera(position=[10, 10, 10], up=[0, 0, 1], children=[DirectionalLight(color='#ffffff', position=[3, 5, 1])])
+        self.renderer = Renderer(camera=self.camera, scene=self.scene, controls=[OrbitControls(controlling=self.camera)], width=800, height=600)
+        self.pointer_geoms = {}
+        display(self.renderer)
+
+    def update(self):
+        ptr = self.bc.ptr
+        alive = ptr.alive
+        if not alive.any(): return
+        deg = (ptr.angles[alive] // self.bc.pf.factor) % 360
+        pos = np.stack([
+            np.cos(np.deg2rad(deg[:,0])) * np.cos(np.deg2rad(deg[:,1])),
+            np.sin(np.deg2rad(deg[:,0])) * np.cos(np.deg2rad(deg[:,1])),
+            np.sin(np.deg2rad(deg[:,1]))
+        ], axis=1) * (ptr.amps[alive] / 20.0 + 0.2)
+
+        if THREEJS:
+            for i in range(len(self.scene.children)):
+                if isinstance(self.scene.children[i], Mesh):
+                    self.scene.remove(self.scene.children[i])
+            for i, p in enumerate(pos):
+                geom = SphereGeometry(radius=0.15 + ptr.amps[alive][i]/50, widthSegments=8, heightSegments=6)
+                mat = MeshStandardMaterial(color=f"hsl({deg[i,2]},100%,50%)", roughness=0.7, metalness=0.3)
+                sphere = Mesh(geometry=geom, material=mat, position=p.tolist())
+                self.scene.add(sphere)
+        else:
+            self.ax.cla()
+            self.ax.scatter(pos[:,0], pos[:,1], pos[:,2], c=ptr.amps[alive], cmap='viridis', s=50)
+            self.ax.set_title(f"Frame {self.bc.frame} | Pointers: {alive.sum()} | Carry: {self.bc.sub.carry.sum()}")
+            plt.pause(0.01)
+
+    def on_mouse(self, event):
+        if not hasattr(self, 'renderer'): return
+        if event['button'] == 1:  # left click
+            if self.dragging is None:
+                self.bc.new_pointer((0,0,0), delta=np.random.randint(1,4), plane=1, amp=30)
+        elif event['button'] == 3:  # right drag
+            pass
+
+    def cleanup(self, *args):
+        if not THREEJS:
+            plt.ioff()
+            plt.close()
+        sys.exit(0)
+
+# ========================= BACKLIT CANOPY ==========================
+class BacklitCanopy:
+    def __init__(self, cubes=CUBES):
+        self.pf = PFLift()
+        self.rom = ROM()
+        self.ptr = PointerBatch()
+        self.sub = Substrate(cubes)
+        self.rigid = RigidManager()
+        self.plugins = [
+            CarryRouting(self.sub),
+            CoherenceDynamics(self.sub),
+            Hebbian3D(self.sub),
+            Condensation(self.sub),
+            PointerPhysicsPlugin(self.sub, self.ptr, self.rigid, self.pf)
+        ]
+        self.frame = 0
+
+    def new_pointer(self, angle=(0,0,0), delta=1, plane=0, amp=20):
+        return self.ptr.add(angle, delta, plane, amp, pf=self.pf)
+
+    def run_plugins_precommit(self):
+        for p in self.plugins: p.compute()
+
+    def flash(self):
+        self.sub.snapshot()
+        res = self.ptr.step(self.pf, self.rom, cubes=self.sub.cubes)
+        for c,p,br,bc,amp in zip(res.get('gap_cube',[]), res.get('gap_plane',[]),
+                                  res.get('gap_br',[]), res.get('gap_bc',[]), res.get('gap_amp',[])):
+            self.sub.carry[c,p,br,bc] += amp
+        for c,p,br,bc,tri in zip(res.get('data_cube',[]), res.get('data_plane',[]),
+                                  res.get('data_br',[]), res.get('data_bc',[]), res.get('data_trit',[])):
+            if tri >= 0: self.sub.logical[c,p,br,bc] = tri + 1
+        self.run_plugins_precommit()
+        self.sub.commit()
+        self.ptr.cleanup()
+        self.frame += 1
+
+# ========================= MAIN ==========================
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--headless", action="store_true")
+    args = parser.parse_args()
+
+    bc = BacklitCanopy()
+    bc.new_pointer((45, 30, 0), delta=2, plane=1, amp=30)
+    bc.new_pointer((135, 30, 180), delta=3, plane=2, amp=25)
+
+    viz = None if args.headless else Visualizer(bc)
+
+    print("BACKLIT CANOPY v53-REALITY — Click to spawn pointers!")
+    try:
+        while True:
+            bc.flash()
+            if viz:
+                viz.update()
+            if bc.frame % 20 == 0:
+                print(f"Frame {bc.frame:4d} | Pointers: {bc.ptr.alive.sum():3d} | Carry: {bc.sub.carry.sum():6d} | Spin: {bc.sub.spin.sum():4d} | Clouds: {bc.sub.clouds.sum():8d}")
+    except KeyboardInterrupt:
+        print("\nShutting down universe...")
+
+if __name__ == "__main__":
+    main()
