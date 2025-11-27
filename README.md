@@ -10,7 +10,7 @@ DOI: 10.5281/zenodo.17730085
 - `v54_omniversal_integer.py` – full engine with conditional deflection (Turing-complete)
 - `genome_kauffman42.py` – the 34-pointer self-replicating organism (Kauffman-42)
 - `rule110_demo.py` – live Rule 110 universal Turing machine on integer spin tape
-- `demos/` – GIFs/MP4s of replication and Rule 110 evolution
+
 
 A living, breathing, interactively steerable artificial life/physics ecosystem.
 The Backlit Canopy code defines an abstract computational substrate for exploring emergent behavior, 
