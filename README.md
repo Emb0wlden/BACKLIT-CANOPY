@@ -4,7 +4,7 @@
 **Discovery of the first minimal autocatalytic set and universal computation in a purely integer-only, topologically protected discrete physics engine.**
 
 Release date: 27 November 2025  
-DOI: (will be minted on Zenodo within minutes of this tag)
+DOI: 10.5281/zenodo.17730085 
 
 ### Contents
 - `v54_omniversal_integer.py` – full engine with conditional deflection (Turing-complete)
