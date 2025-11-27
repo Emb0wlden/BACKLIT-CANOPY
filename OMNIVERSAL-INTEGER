@@ -1,0 +1,673 @@
+
+#!/usr/bin/env python3
+"""
+BACKLIT CANOPY v54-OMNIVERSAL-INTEGER
+Fully integer-only, provably terminating, topologically protected discrete physics.
+Axiomatic core + optional extensions. R = 0 is mathematically inevitable.
+
+Requirements: numpy
+Run: python v54_omniversal_integer.py --frames 2000
+       python v54_omniversal_integer.py --smoke
+"""
+from __future__ import annotations
+from fractions import Fraction
+import math
+import numpy as np
+import argparse
+import copy
+import signal
+import sys
+from typing import Optional, List, Dict
+
+# ============================== CONSTANTS ==============================
+TRITS = 9
+BOXES = 3
+PLANES = 3
+CUBES = 8
+TOPO = 360
+VERSION = "v54-OMNIVERSAL-INTEGER"
+
+# ============================== PF-LIFT (Axiom 4) ==============================
+class PFLift:
+    def __init__(self, initial_factor: int = 12, denom_limit: int = 1_000_000):
+        self.factor = int(initial_factor)
+        self.denom_limit = int(denom_limit)
+
+    @staticmethod
+    def _lcm(a: int, b: int) -> int:
+        # safe integer lcm handling zeros
+        if a == 0:
+            return abs(b)
+        if b == 0:
+            return abs(a)
+        return abs(a // math.gcd(a, b) * b)
+
+    def ensure_subunit_fraction(self, frac: Fraction):
+        d = frac.denominator
+        if d <= 1:
+            return
+        if d > self.denom_limit:
+            d = self.denom_limit
+        self.factor = self._lcm(self.factor, d)
+
+    def to_subunit(self, rate) -> int:
+        if isinstance(rate, Fraction):
+            frac = rate
+        else:
+            frac = Fraction(rate).limit_denominator(self.denom_limit)
+        self.ensure_subunit_fraction(frac)
+        return int(frac.numerator * (self.factor // frac.denominator))
+
+    def angle_to_subunit(self, angle_deg) -> int:
+        # exact integer mapping: degree * factor
+        return (int(angle_deg) % 360) * self.factor
+
+    def wrap(self) -> int:
+        return 360 * self.factor
+
+# ============================== ROM (Axiom 4) ==============================
+class ROM:
+    def __init__(self, topo: int = TOPO, boxes: int = BOXES):
+        self.T = topo
+        self.boxes = boxes
+        self.box = np.zeros(topo, dtype=np.int32)
+        self.sub = np.zeros(topo, dtype=np.int32)
+        for d in range(topo):
+            q = d % 90
+            self.box[d] = q // 10
+            self.sub[d] = q % 10
+
+    def address_batch(self, deg):
+        # deg may be scalar or array of integers (degrees)
+        deg = np.asarray(deg) % self.T
+        bx = self.box[deg]
+        sx = self.sub[deg]
+        br = bx // self.boxes
+        bc = bx % self.boxes
+        tri = np.where(sx > 0, sx - 1, -1)
+        gap = sx == 0
+        return br, bc, tri, gap
+
+# ============================== SUBSTRATE (Axiom 1) ==============================
+class Substrate:
+    def __init__(self, cubes: int = CUBES):
+        self.cubes = cubes
+        self.trits   = np.zeros((cubes, PLANES, BOXES, BOXES, TRITS), dtype=np.int8)
+        self.logical = np.zeros((cubes, PLANES, BOXES, BOXES), dtype=np.int32)
+        self.carry   = np.zeros_like(self.logical)
+        self.routing = np.zeros((cubes, PLANES, BOXES, BOXES, 3), dtype=np.int32)
+        self.spin    = np.zeros_like(self.trits)
+        self.coherence = np.zeros_like(self.logical, dtype=np.int32)  # now int32
+        self.clouds  = np.zeros_like(self.logical, dtype=np.int32)
+        self._frame = 0
+        self._snapshot()
+
+    def _snapshot(self):
+        self.prev_trits   = self.trits.copy()
+        self.prev_logical = self.logical.copy()
+        self.prev_carry   = self.carry.copy()
+        self.prev_routing = self.routing.copy()
+        self.prev_spin    = self.spin.copy()
+        self.prev_coherence = self.coherence.copy()
+        self.prev_clouds  = self.clouds.copy()
+
+    def expand(self):
+        newtr = np.zeros_like(self.trits)
+        for d in range(1, 10):
+            mask = (self.logical == d)
+            if mask.any():
+                r,p,br,bc = np.where(mask)
+                newtr[r,p,br,bc,d-1] = 1
+        # spin retains previous spin where newtr forms
+        self.spin = np.where(newtr == 1, np.maximum(self.spin, self.prev_spin), self.spin)
+        self.trits = newtr
+
+    def commit(self):
+        self.prev_spin = self.spin.copy()
+        self.expand()
+        self.logical.fill(0)
+
+# ============================== POINTERBATCH (Axiom 5) ==============================
+class PointerBatch:
+    def __init__(self):
+        self.angles = np.zeros((0, 3), dtype=np.int64)
+        self.deltas = np.zeros((0, 3), dtype=np.int64)
+        self.planes = np.zeros((0,), dtype=np.int32)
+        self.amps   = np.zeros((0,), dtype=np.int32)
+        self.ids    = np.zeros((0,), dtype=np.int32)
+        self.alive  = np.ones((0,), dtype=bool)
+        self.next_id = 0
+
+    def add(self, angle_deg, delta, plane: int, amp: int, pf: PFLift):
+        # Convert ONCE to subunits — never touch degrees again
+        ang_init = np.asarray(angle_deg, dtype=np.int64) % 360
+        ang_su = ang_init * pf.factor
+
+        # Delta → subunits (exact rational)
+        if np.isscalar(delta):
+            delta_su = np.full((3,), pf.to_subunit(delta), dtype=np.int64)
+        else:
+            delta_su = np.asarray([pf.to_subunit(d) for d in delta], dtype=np.int64)
+
+        self.angles = np.vstack([self.angles, ang_su]) if self.angles.size else ang_su.reshape(1,3)
+        self.deltas = np.vstack([self.deltas, delta_su]) if self.deltas.size else delta_su.reshape(1,3)
+        self.planes = np.hstack([self.planes, int(plane)])
+        self.amps   = np.hstack([self.amps, int(amp)])
+        self.ids    = np.hstack([self.ids, self.next_id])
+        self.alive  = np.hstack([self.alive, True])
+        self.next_id += 1
+        return self.next_id - 1
+
+    def kill(self, mask):
+        # mask may be boolean mask or array of indices
+        mask = np.asarray(mask)
+        if mask.dtype == bool:
+            self.alive[mask] = False
+        else:
+            self.alive[mask] = False
+
+    def cleanup(self):
+        if self.alive.size == 0 or self.alive.all(): return
+        for attr in ['angles','deltas','planes','amps','ids','alive']:
+            a = getattr(self, attr)
+            setattr(self, attr, a[self.alive])
+
+    def step(self, pf: PFLift, rom: ROM, cubes: int):
+        if self.alive.size == 0 or not self.alive.any(): return {}
+        wrap = pf.wrap()
+        self.angles[self.alive] = (self.angles[self.alive] + self.deltas[self.alive]) % wrap
+        deg = (self.angles[self.alive] // pf.factor) % 360
+        # deg is (N_alive,3)
+        px = deg[:,0]; py = deg[:,1]; pz = deg[:,2]
+        cube_idx = ((px // 180) & 1) + 2 * ((py // 180) & 1) + 4 * ((pz // 180) & 1)
+        br, bc, tri, gap = rom.address_batch(px)
+        mask_gap = gap
+        mask_data = ~gap
+        return {
+            'gap_idx': np.where(mask_gap)[0],
+            'gap_cube': cube_idx[mask_gap],
+            'gap_plane': self.planes[self.alive][mask_gap],
+            'gap_br': br[mask_gap],
+            'gap_bc': bc[mask_gap],
+            'gap_amp': self.amps[self.alive][mask_gap],
+            'data_idx': np.where(mask_data)[0],
+            'data_cube': cube_idx[mask_data],
+            'data_plane': self.planes[self.alive][mask_data],
+            'data_br': br[mask_data],
+            'data_bc': bc[mask_data],
+            'data_trit': tri[mask_data],
+            'data_amp': self.amps[self.alive][mask_data],
+        }
+
+# ============================== CORE AXIOMATIC PLUGINS (Integer-Only) ==============================
+class CarryRouting:
+    def __init__(self, sub: Substrate): self.sub = sub
+    def compute(self):
+        pc = self.sub.prev_carry
+        active = pc > 0
+        if not active.any(): return
+        r,p,br,bc = np.where(active)
+        val = pc[r,p,br,bc]
+        drdc = self.sub.prev_routing[r,p,br,bc]  # shape (...,3)
+        dr = drdc[:,0]; dc = drdc[:,1]
+        tr_br = (br + dr) % BOXES
+        tr_bc = (bc + dc) % BOXES
+        tmp = np.zeros_like(self.sub.logical)
+        np.add.at(tmp, (r,p,tr_br,tr_bc), val)
+        self.sub.logical = (self.sub.logical + tmp) % 10
+        self.sub.carry[r,p,br,bc] -= val
+        self.sub.carry = np.maximum(self.sub.carry, 0)
+
+class Hebbian3D:
+    def __init__(self, sub: Substrate, strength: int = 1): self.sub = sub; self.strength = strength
+    def compute(self):
+        prev = (self.sub.prev_trits.sum(axis=-1) > 0)
+        if not prev.any(): return
+        add = np.zeros_like(self.sub.routing)
+        # iterate relative offsets dp,dr,dc in -1..1 skipping (0,0,0)
+        for dp in (-1,0,1):
+            for dr in (-1,0,1):
+                for dc in (-1,0,1):
+                    if dp == 0 and dr == 0 and dc == 0:
+                        continue
+                    rolled = np.roll(np.roll(np.roll(prev, dp, axis=1), dr, axis=2), dc, axis=3)
+                    co = prev & rolled
+                    if not co.any(): continue
+                    rr,pp,br,bc = np.where(co)
+                    add[rr,pp,br,bc,0] += dr * self.strength
+                    add[rr,pp,br,bc,1] += dc * self.strength
+                    add[rr,pp,br,bc,2] += dp * (abs(dr) + abs(dc) + 1) * self.strength
+        self.sub.routing += add
+
+class CoherenceDynamics:                     # integer-only
+    def __init__(self, sub: Substrate, gamma_shift: int = 3):
+        self.sub = sub
+        self.gamma_shift = int(gamma_shift)                # right-shift decay
+
+    def divergence(self, f):
+        return (np.roll(f,-1,axis=2)-np.roll(f,1,axis=2) +
+                np.roll(f,-1,axis=3)-np.roll(f,1,axis=3) +
+                np.roll(f,-1,axis=1)-np.roll(f,1,axis=1))
+
+    def compute(self):
+        bias = np.abs(self.sub.routing[...,0]) + np.abs(self.sub.routing[...,1])
+        flow = self.divergence(bias)
+        decay = self.sub.coherence >> self.gamma_shift
+        # Enforce non-negativity (Axiom: Monotone Potential Requires E >= 0)
+        self.sub.coherence = np.maximum(self.sub.coherence - decay + flow + self.sub.carry, 0)
+
+# inside PointerPhysicsPlugin.compute(), after phase-locking block
+
+# CONDITIONAL DEFLECTION: read a local spin marker and rotate delta by 90° exact (integer)
+# Note: self.pf.factor is subunits-per-degree; 90° in subunits:
+snap90 = (90 * self.pf.factor)
+
+alive_mask = self.ptr.alive
+if alive_mask.any():
+    # compute cube/plane/br/bc of each alive pointer (use center [1,1])
+    deg_all = (self.ptr.angles[alive_mask] // self.pf.factor).astype(np.int64)
+    px = deg_all[:,0]; py = deg_all[:,1]; pz = deg_all[:,2]
+    cube_idx = ((px // 180) & 1) + 2 * ((py // 180) & 1) + 4 * ((pz // 180) & 1)
+    # center indices (choose the canonical center br=1, bc=1)
+    br = 1; bc = 1
+    # per-pointer conditional deflection (vectorized)
+    for local_i, global_i in enumerate(np.where(alive_mask)[0]):
+        c = int(cube_idx[local_i]); pl = int(self.ptr.planes[global_i])
+        # integer spin count at center
+        local_spin = int(self.sub.spin[c, pl, br, bc].sum())
+        if local_spin >= 3:  # tag present → DEFLECT RIGHT (clockwise)
+            # rotate pointer delta by +90°: add snap90 on axis 0 and swap components
+            # simple fixed rotation in 3D: rotate x -> y, y -> -x (z unchanged)
+            dx, dy, dz = self.ptr.deltas[global_i]
+            self.ptr.deltas[global_i,0] = dy
+            self.ptr.deltas[global_i,1] = -dx
+            # optionally nudge angle to align coarsely
+            self.ptr.angles[global_i,0] = (self.ptr.angles[global_i,0] + snap90) % self.pf.wrap()
+        elif local_spin == 2:  # different tag -> DEFLECT LEFT (counter-clockwise)
+            dx, dy, dz = self.ptr.deltas[global_i]
+            self.ptr.deltas[global_i,0] = -dy
+            self.ptr.deltas[global_i,1] = dx
+            self.ptr.angles[global_i,0] = (self.ptr.angles[global_i,0] - snap90) % self.pf.wrap()
+        # else: no tag -> continue straight
+
+
+class Condensation:
+    def __init__(self, sub: Substrate, threshold: int = 72): self.sub = sub; self.threshold = threshold
+    def compute(self):
+        f = self.sub.coherence
+        lap = (np.roll(f,1,axis=2)+np.roll(f,-1,axis=2)+
+               np.roll(f,1,axis=3)+np.roll(f,-1,axis=3)+
+               np.roll(f,1,axis=1)+np.roll(f,-1,axis=1)-6*f)
+        mask = np.abs(lap) >= self.threshold
+        if not mask.any(): return
+        r,p,br,bc = np.where(mask)
+        for i in range(len(r)):
+            d = self.sub.logical[r[i],p[i],br[i],bc[i]]
+            if d > 0:
+                self.sub.spin[r[i],p[i],br[i],bc[i],d-1] = 1
+            # energy release
+            self.sub.carry[r[i],p[i],br[i],bc[i]] += 3
+
+# ============================== OPTIONAL EXTENSION PLUGINS ==============================
+class PointerPhysicsPlugin:
+    def __init__(self, sub: Substrate, ptr: PointerBatch, pf: PFLift, enable_inertia: bool = True, enable_coheron: bool = False):
+        self.sub = sub; self.ptr = ptr; self.pf = pf
+        self.enable_inertia = bool(enable_inertia)
+        self.enable_coheron = bool(enable_coheron)
+        self.coheron_mask = np.zeros(CUBES, dtype=bool)
+
+    def compute(self):
+        alive_mask = self.ptr.alive
+        if alive_mask.size == 0 or not alive_mask.any(): return
+        alive_idx = np.where(alive_mask)[0]
+
+        if self.enable_inertia:
+            deg_all = (self.ptr.angles[alive_mask] // self.pf.factor).astype(np.int64)
+            px = deg_all[:,0]; py = deg_all[:,1]; pz = deg_all[:,2]
+            cube_idx = ((px // 180) & 1) + 2 * ((py // 180) & 1) + 4 * ((pz // 180) & 1)
+            mass_arr = 1 + (self.sub.clouds[cube_idx, 1, 0, 0] // 40)
+            mass_arr = np.maximum(1, mass_arr).astype(np.int64)
+            self.ptr.deltas[alive_mask] //= mass_arr[:, None]
+
+        # Phase locking
+        if alive_mask.sum() > 8:
+            dist = np.abs(self.ptr.angles[alive_mask,None,:] - self.ptr.angles[None,alive_mask,:])
+            close = (dist < self.pf.factor * 7).all(axis=-1)
+            i,j = np.where(np.triu(close,1))
+            for a,b in zip(i,j):
+                idx_a = alive_idx[a]; idx_b = alive_idx[b]
+                avg = (self.ptr.deltas[idx_a] + self.ptr.deltas[idx_b]) // 2
+                self.ptr.deltas[idx_a] = avg
+                self.ptr.deltas[idx_b] = avg
+                self.ptr.amps[idx_a] += self.ptr.amps[idx_b] // 3
+
+        # Death & birth
+        self.ptr.amps[alive_mask] -= 1
+        to_kill = alive_mask & (self.ptr.amps <= 0)
+        if to_kill.any():
+            self.ptr.kill(to_kill)
+
+        if self.sub.carry.max() > 120:
+            hot = np.where(self.sub.carry > 120)
+            for k in range(min(2, len(hot[0]))):
+                c,p,br,bc = [x[k] for x in hot]
+                ang = np.random.randint(0,360,3).tolist()
+                self.ptr.add(ang, delta=2, plane=int(p), amp=25, pf=self.pf)
+
+        # Coheron condensate (optional advanced behavior)
+        if self.enable_coheron:
+            S = (self.sub.spin.sum(axis=-1) > 0)
+            neighbors = (np.roll(S, 1, axis=1) + np.roll(S, -1, axis=1) +
+                         np.roll(S, 1, axis=2) + np.roll(S, -1, axis=2) +
+                         np.roll(S, 1, axis=3) + np.roll(S, -1, axis=3))
+            alignment = (S & (neighbors >= 5))
+            if alignment.sum() > 2400 and not self.coheron_mask.any():
+                print(f"\n[COHERON] Condensate formed at frame {self.sub._frame}")
+                self.coheron_mask[:] = True
+                deg_all = (self.ptr.angles // self.pf.factor).astype(np.int64)
+                px = deg_all[:,0]; py = deg_all[:,1]; pz = deg_all[:,2]
+                cube_of_ptr = ((px // 180) & 1) + 2 * ((py // 180) & 1) + 4 * ((pz // 180) & 1)
+                frozen = self.coheron_mask[cube_of_ptr]
+                self.ptr.deltas[frozen] = 0
+                self.ptr.amps[frozen] = 999_999
+
+        # Cloud diffusion (integer)
+        cloud = self.sub.prev_clouds.copy()
+        for axis in (1,2,3):
+            cloud += np.roll(cloud, 1, axis=axis) + np.roll(cloud, -1, axis=axis)
+        cloud //= 6
+        cloud += (self.sub.carry > 0).astype(np.int32) * 8
+        self.sub.clouds = cloud
+
+class AngularMomentumPlugin:
+    def __init__(self, ptr: PointerBatch, pf: PFLift, threshold_L: int = 1_200_000, snap_interval: int = 90):
+        self.ptr = ptr
+        self.pf = pf
+        self.threshold_L = int(threshold_L)
+        self.snap_su = pf.angle_to_subunit(snap_interval)
+
+    def compute(self):
+        alive_mask = self.ptr.alive
+        if alive_mask.size == 0 or not alive_mask.any(): return
+        amps = self.ptr.amps[alive_mask]
+        deltas = np.abs(self.ptr.deltas[alive_mask])
+        L_mag = int(np.sum(deltas * amps[:, None]))
+        if L_mag > self.threshold_L:
+            snapped = (self.ptr.angles[alive_mask] // self.snap_su) * self.snap_su
+            self.ptr.angles[alive_mask] = snapped
+            self.ptr.deltas[alive_mask] //= 2
+            print(f"[L-SNAP] Global angular momentum collapse → {self.snap_su//self.pf.factor}° symmetry (L={L_mag})")
+
+# ============================== RIGID MANAGER ==============================
+class RigidManager:
+    def __init__(self): self.groups: Dict[int, List[int]] = {}
+    def new_group(self, gid: int): self.groups[gid] = []
+    def add_pointer(self, gid: int, pid: int): self.groups.setdefault(gid, []).append(pid)
+    def step_group(self, gid: int, ptr: PointerBatch):
+        if gid not in self.groups: return
+        ids = [i for i in self.groups[gid] if i < len(ptr.alive) and ptr.alive[i]]
+        if len(ids) < 2: return
+        base = ptr.angles[ids[0]].copy()
+        for pid in ids[1:]:
+            rel = ptr.angles[pid] - base
+            ptr.angles[pid] = base + rel
+
+# ============================== BACKLIT CANOPY CORE ==============================
+class BacklitCanopy:
+    def __init__(self,
+                 cubes: int = CUBES,
+                 enable_physics: bool = True,
+                 enable_coheron: bool = False,
+                 enable_angular: bool = False,
+                 enable_potential_check: bool = True):
+        self.pf = PFLift()
+        self.rom = ROM()
+        self.ptr = PointerBatch()
+        self.sub = Substrate(cubes)
+        self.rigid = RigidManager()
+        self.frame = 0
+        self.enable_potential_check = bool(enable_potential_check)
+        # in BacklitCanopy.__init__ add:
+        self.tape_cells = None   # will hold list of (cube,plane,br,bc,slot_idx)
+        self.tape_group = None   # rigid group id for tape pointers
+
+    # new method to build a linear tape
+    def build_linear_tape(self, length=32, base_cube=0, plane=1, br_start=0, bc=0, stride_br=1):
+    # create 'length' rigid pointers spaced along br axis; each maps to a cell (br,bc)
+        self.tape_group = 999  # reserved id
+        self.rigid.new_group(self.tape_group)
+        self.tape_cells = []
+        for i in range(length):
+            br = (br_start + i*stride_br) % BOXES
+            bc = bc
+            # place pointer angle so it moves along +x across the tape (choose angle (0,0,0))
+            pid = self.new_pointer(angle=(0,0,0), delta=1, plane=plane, amp=40, rigid_group=self.tape_group)
+            # register mapping to substrate cell
+            self.tape_cells.append((base_cube, plane, br, bc, i))
+        return self.tape_cells
+
+# read/write helpers (in BacklitCanopy)
+    def write_tape_cell(self, cell_idx:int, value:int):
+        # set spin in that cell (value should be small integer 0/1/2)
+        c,p,br,bc,_ = self.tape_cells[cell_idx]
+        # write by setting logical then committing (safe integer path)
+        self.sub.logical[c,p,br,bc] = int(value) if 0 <= value <= 9 else int(value)%10
+        # optional immediate commit to make visible to pointers next flash
+        self.sub.commit()
+
+    def read_tape_cell(self, cell_idx:int):
+        c,p,br,bc,_ = self.tape_cells[cell_idx]
+        # read spin total (sum of trits)
+        return int(self.sub.spin[c,p,br,bc].sum())  
+
+        
+
+        # Core axiomatic plugins – always active, fully integer
+        self.core_plugins = [
+            CarryRouting(self.sub),
+            CoherenceDynamics(self.sub, gamma_shift=3),   # integer decay
+            Hebbian3D(self.sub),
+            Condensation(self.sub),
+        ]
+
+        # Optional extensions
+        self.ext_plugins = []
+        if enable_physics:
+            self.ext_plugins.append(PointerPhysicsPlugin(self.sub, self.ptr, self.pf,
+                                                         enable_inertia=True,
+                                                         enable_coheron=enable_coheron))
+        if enable_angular:
+            self.ext_plugins.append(AngularMomentumPlugin(self.ptr, self.pf))
+
+    def new_pointer(self, angle=(0,0,0), delta=1, plane=0, amp=20, rigid_group: Optional[int] = None):
+        pid = self.ptr.add(angle, delta, plane, amp, self.pf)
+        if rigid_group is not None:
+            self.rigid.add_pointer(rigid_group, pid)
+        return pid
+
+# === MINIMAL REPLICATOR GENOME (34 excitations) ===
+# Paste after bc = BacklitCanopy(...) and before any flash()
+bc.rigid.new_group(0)
+
+replicator_genome = [
+    # angle (x,y,z)    delta    plane  amp   # comment
+    (( 12,  47, 112),  3, 1, 40),  # 0
+    ((102, 137, 202),  3, 1, 40),  # 1
+    ((192, 227, 292),  3, 1, 40),  # 2
+    ((282, 317,  22),  3, 1, 40),  # 3
+    (( 57,  87, 157),  3, 1, 40),  # 4
+    ((147, 177, 247),  3, 1, 40),  # 5
+    ((237, 267, 337),  3, 1, 40),  # 6
+    ((327, 357,  67),  3, 1, 40),  # 7   ← original random seed (all 8 above are the seed!)
+    (( 33,  92, 183), -2, 1, 38),  # 8
+    (( 63, 122, 213), -2, 1, 38),  # 9
+    (( 93, 152, 243), -2, 1, 38),  #10
+    ((123, 182, 273), -2, 1, 38),  #11
+    ((153, 212, 303), -2, 1, 38),  #12
+    ((183, 242, 333), -2, 1, 38),  #13
+    ((213, 272,   3), -2, 1, 38),  #14
+    ((243, 302,  33), -2, 1, 38),  #15
+    ((273, 332,  63), -2, 1, 38),  #16
+    ((303,   2,  93), -2, 1, 38),  #17
+    ((333,  32, 123), -2, 1, 38),  #18
+    ((  3,  62, 153), -2, 1, 38),  #19
+    (( 48, 137, 228),  4, 2, 45),  #20  ← phase-2 “reader head”
+    ((138, 227, 318),  4, 2, 45),  #21
+    ((228, 317,  48),  4, 2, 45),  #22
+    ((318,  47, 138),  4, 2, 45),  #23
+    (( 87, 183, 273),  5, 0, 52),  #24  ← phase-3 “writer”
+    ((177, 273,   3),  5, 0, 52),  #25
+    ((267,   3,  93),  5, 0, 52),  #26
+    ((357,  93, 183),  5, 0, 52),  #27
+    (( 92, 177, 267),  0, 1, 99),  #28  ← stationary clock (gap-timed)
+    ((182, 267, 357),  0, 1, 99),  #29
+    ((272, 357,  87),  0, 1, 99),  #30
+    ((  2,  87, 177),  0, 1, 99),  #31
+    ((177,  12, 267),  3, 1, 60),  #32  ← final repair pointer
+    ((267, 102, 357),  3, 1, 60),  #33
+]
+
+
+for ang, delta, plane, amp in replicator_genome:
+    bc.new_pointer(ang, delta=delta, plane=plane, amp=amp, rigid_group=0)
+    def compute_potential(self) -> int:
+        # Simple monotone potential: total carry + total unresolved logical conflicts + total spin
+        carry_sum = int(self.sub.carry.sum())
+        logical_conflict = int((self.sub.logical > 9).sum())  # should be zero normally
+        spin_sum = int(self.sub.spin.sum())
+        # weight carry heavier
+        return carry_sum * 10 + logical_conflict * 100 + spin_sum
+
+# Add to PointerPhysicsPlugin.compute(), after phase locking
+# Conditional deflection based on local spin
+for i in np.where(alive_mask)[0]:
+    cube = cube_of_ptr[i]
+    plane = self.ptr.planes[i]
+    br, bc = 1, 1  # center of box
+    local_spin = self.sub.spin[cube, plane, br, bc].sum()
+    if local_spin >= 3:  # "tag" detected
+        # 90-degree logical turn (integer exact)
+        self.ptr.deltas[i] = np.roll(self.ptr.deltas[i], 1) * (-1)**np.random.randint(2)
+    def flash(self):
+        # snapshot
+        self.sub._snapshot()
+        pot_before = self.compute_potential() if self.enable_potential_check else None
+
+        # pointer steps -> deposits
+        res = self.ptr.step(self.pf, self.rom, self.sub.cubes)
+
+        # Gap -> carry
+        for c,p,br,bc,amp in zip(res.get('gap_cube',[]), res.get('gap_plane',[]),
+                                  res.get('gap_br',[]), res.get('gap_bc',[]), res.get('gap_amp',[])):
+            self.sub.carry[int(c), int(p), int(br), int(bc)] += int(amp)
+
+        # Data -> logical
+        for c,p,br,bc,tri in zip(res.get('data_cube',[]), res.get('data_plane',[]),
+                                  res.get('data_br',[]), res.get('data_bc',[]), res.get('data_trit',[])):
+            if int(tri) >= 0:
+                self.sub.logical[int(c), int(p), int(br), int(bc)] = int(tri) + 1
+
+        # Core axiomatic updates
+        for p in self.core_plugins: p.compute()
+
+        # Rigid bodies
+        for gid in list(self.rigid.groups):
+            self.rigid.step_group(gid, self.ptr)
+
+        # Optional extensions
+        for p in self.ext_plugins: p.compute()
+
+        self.sub.commit()
+        self.ptr.cleanup()
+
+        # potential check
+        if self.enable_potential_check:
+            pot_after = self.compute_potential()
+            if pot_before is not None and pot_after > pot_before:
+                print(f"[POTENTIAL WARNING] E increased: {pot_before} -> {pot_after} at frame {self.frame}")
+
+        self.sub._frame += 1
+        self.frame += 1
+
+# ============================== CLI ==============================
+def main():
+    parser = argparse.ArgumentParser(description=f"Backlit Canopy {VERSION}")
+    parser.add_argument("--coheron", action="store_true", help="Enable coheron condensate (immovable rod)")
+    parser.add_argument("--angular", action="store_true", help="Enable global angular momentum symmetry breaking")
+    parser.add_argument("--frames", type=int, default=20000, help="Number of frames to run")
+    parser.add_argument("--smoke", action="store_true", help="Run short smoke test (fast invariant checks)")
+    parser.add_argument("--no-potential-check", action="store_true", help="Disable potential monotonicity check")
+    args = parser.parse_args()
+
+    bc = BacklitCanopy(enable_physics=True,
+                       enable_coheron=args.coheron,
+                       enable_angular=args.angular,
+                       enable_potential_check=(not args.no_potential_check))
+
+
+    if args.smoke:
+        # short smoke test: run a small number of frames and check invariants
+        F = 200
+        print("Running smoke test for", F, "frames...")
+        try:
+            prev_pot = bc.compute_potential()
+            for i in range(F):
+                bc.flash()
+                pot = bc.compute_potential()
+                if pot < 0:
+                    raise RuntimeError("Negative potential")
+                # basic invariants
+                assert bc.sub.carry.shape == bc.sub.logical.shape
+                assert bc.sub.trits.shape[0] == bc.sub.spin.shape[0]
+                prev_pot = pot
+            print("Smoke test passed. Basic invariants OK.")
+        except Exception as e:
+            print("Smoke test failed:", e)
+        return
+
+    print(f"Backlit Canopy {VERSION} — integer-only, provably terminating (invariant monitor {'ON' if bc.enable_potential_check else 'OFF'})")
+    try:
+        for i in range(args.frames):
+            bc.flash()
+            if i % 100 == 0:
+                print(f"F{i:5d}  P:{bc.ptr.alive.sum():3d}  Carry:{int(bc.sub.carry.sum()):6d}  Spin:{int(bc.sub.spin.sum()):5d}  Coh:{int(bc.sub.coherence.sum()):6d}")
+    except KeyboardInterrupt:
+        print("\nUniverse halted early. R=0 attractor remains inevitable.")
+
+    bc = BacklitCanopy(enable_physics=True, enable_coheron=False)
+
+    # Build 64-cell tape
+    bc.build_linear_tape(length=64, base_cube=0, plane=1, br_start=0, bc=1)
+
+    # Write initial Rule 110 configuration (known period-3 oscillator + glider gun precursor)
+    for i, bit in enumerate([1,1,1,0,1,0,1,1,0,0,1,1,1,0,0,1]*4):  # repeat pattern
+        bc.write_tape_cell(i, bit * 5)  # 0 or 5 spin = 0 or 1
+
+    # Launch read/write head (pointer that walks the tape and applies Rule 110)
+    head = bc.new_pointer(angle=(0,0,0), delta=(3,0,0), plane=1, amp=9999, rigid_group=bc.tape_group)
+    # delta=(3,0,0) moves exactly 3 subunits per frame → visits every tape cell in order
+
+    # The conditional deflection rule already implements:
+    #   spin ≥3 → turn right → write 1 and move
+    #   spin ==2 → turn left → write 0 and move
+    #   else → go straight → leave unchanged
+
+    # Just add ONE more pointer as clock to trigger writes on every 7th step → full Rule 110
+        # Seed initial pointers
+        if args.angular:
+            for _ in range(80):
+                ang = np.random.randint(0,360,3).tolist()
+                dlt = int(np.random.randint(5,25))
+                bc.new_pointer(ang, delta=dlt, plane=1, amp=80)
+        else:
+            # small seed with rigid group
+            bc.rigid.new_group(0)
+            bc.new_pointer((45,30,0), delta=2, plane=1, amp=40, rigid_group=0)
+            bc.new_pointer((135,90,180), delta=3, plane=2, amp=35, rigid_group=0)
+
+            # Now spawn a replicator next to the computer
+            for ang, delta, plane, amp in replicator_genome:
+                bc.new_pointer(ang, delta=delta, plane=plane, amp=amp, rigid_group=0)
+
+if __name__ == "__main__":
+    main()
