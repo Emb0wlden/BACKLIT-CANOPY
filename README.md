@@ -5,7 +5,7 @@
 
 Release date: 27 November 2025  
 DOI: 10.5281/zenodo.17730085 
-
+https://zenodo.org/records/17730085
 ### Contents
 - `v54_omniversal_integer.py` – full engine with conditional deflection (Turing-complete)
 - `genome_kauffman42.py` – the 34-pointer self-replicating organism (Kauffman-42)
